@@ -12,6 +12,7 @@ namespace BonyankopAPI.Controllers;
 [Route("api/[controller]")]
 public class DiagnosticController : ControllerBase
 {
+    //test
     private readonly IDiagnosticRepository _diagnosticRepository;
     private readonly IAiDiagnosticService _aiService;
     private readonly IUserRepository _userRepository;
