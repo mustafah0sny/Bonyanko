@@ -48,6 +48,7 @@ namespace BonyankopAPI.Services
             return new JwtSecurityTokenHandler().WriteToken(token);
         }
 
+
         public Guid GetUserIdFromToken(ClaimsPrincipal user)
         {
             // Try all NameIdentifier claims — JWT middleware may remap or duplicate them
