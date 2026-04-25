@@ -12,7 +12,7 @@ namespace BonyankopAPI.Controllers
     [Route("api/[controller]")]
     [ApiController]
     [Produces("application/json")]
-    //[Authorize]
+    [Authorize]
     public class ProfileController : ControllerBase
     {
         private readonly IUserRepository _userRepository;
