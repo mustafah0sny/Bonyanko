@@ -50,12 +50,19 @@ namespace BonyankopAPI.Services
 
         public Guid GetUserIdFromToken(ClaimsPrincipal user)
         {
-            var userIdClaim = user.FindFirst(ClaimTypes.NameIdentifier);
-            if (userIdClaim == null)
+            // Try all NameIdentifier claims — JWT middleware may remap or duplicate them
+            foreach (var claim in user.FindAll(ClaimTypes.NameIdentifier))
             {
-                throw new UnauthorizedAccessException("User ID not found in token");
+                if (Guid.TryParse(claim.Value, out var guid))
+                    return guid;
             }
-            return Guid.Parse(userIdClaim.Value);
+
+            // Fallback: check the raw "nameid" claim used by some JWT handlers
+            var nameIdClaim = user.FindFirst("nameid");
+            if (nameIdClaim != null && Guid.TryParse(nameIdClaim.Value, out var nameIdGuid))
+                return nameIdGuid;
+
+            throw new UnauthorizedAccessException("User ID not found in token");
         }
     }
 }
