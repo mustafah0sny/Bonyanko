@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using BonyankopAPI.Interfaces;
 using BonyankopAPI.Models;
 
@@ -5,40 +6,134 @@ namespace BonyankopAPI.Services;
 
 public class AiDiagnosticService : IAiDiagnosticService
 {
-    private readonly ILogger<AiDiagnosticService> _logger;
-    private const string AI_MODEL_VERSION = "v1.0.0-mock";
+    private const string AI_MODEL_VERSION = "CrackVision v5.1.0";
 
-    public AiDiagnosticService(ILogger<AiDiagnosticService> logger)
+    private readonly ICrackVisionClient _crackVision;
+    private readonly ILogger<AiDiagnosticService> _logger;
+
+    public AiDiagnosticService(ICrackVisionClient crackVision, ILogger<AiDiagnosticService> logger)
     {
+        _crackVision = crackVision;
         _logger = logger;
     }
 
-    public async Task<DiagnosticResult> AnalyzeImageAsync(string imageUrl, ImageMetadata metadata)
+    public async Task<DiagnosticResult> AnalyzeImageAsync(
+        byte[] imageBytes,
+        string fileName,
+        string contentType,
+        CancellationToken cancellationToken = default)
     {
-        var startTime = DateTime.UtcNow;
+        var stopwatch = Stopwatch.StartNew();
 
-        try
-        {
-            _logger.LogInformation($"Starting AI analysis for image: {imageUrl}");
+        _logger.LogInformation("Starting CrackVision analysis for '{FileName}'", fileName);
 
-            // TODO: Replace with actual AI model integration (e.g., Azure Computer Vision, AWS Rekognition, or custom ML model)
-            // This is a mock implementation that simulates AI analysis
+        var (response, rawJson) = await _crackVision.PredictAsync(imageBytes, fileName, contentType, cancellationToken);
 
-            await Task.Delay(Random.Shared.Next(500, 2000)); // Simulate processing time
+        stopwatch.Stop();
 
-            var result = GenerateMockDiagnostic(metadata);
-            result.ProcessingTimeMs = (int)(DateTime.UtcNow - startTime).TotalMilliseconds;
+        var result = MapToDiagnosticResult(response, rawJson);
+        // Prefer the model's own inference time; fall back to round-trip time.
+        result.ProcessingTimeMs = response.InferenceMs > 0 ? response.InferenceMs : (int)stopwatch.ElapsedMilliseconds;
 
-            _logger.LogInformation($"AI analysis completed in {result.ProcessingTimeMs}ms with confidence {result.AiConfidenceScore}%");
+        _logger.LogInformation(
+            "CrackVision analysis completed: risk={Risk}, defects={Defects}, confidence={Confidence}%",
+            result.RiskLevel, response.TotalInstances, result.AiConfidenceScore);
 
-            return result;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error during AI image analysis");
-            throw;
-        }
+        return result;
     }
+
+    private DiagnosticResult MapToDiagnosticResult(CrackVisionResponse response, string rawJson)
+    {
+        var overall = response.Overall;
+        var primary = response.PrimaryDefect;
+
+        var riskLevel = MapSeverityToRiskLevel(overall?.Label);
+        var urgency = MapToUrgency(riskLevel, overall?.RequiresClosure ?? false);
+
+        // No structural damage detected -> clean, low-risk result.
+        if (!response.HasDefects || primary == null)
+        {
+            return new DiagnosticResult
+            {
+                RiskLevel = RiskLevel.LOW,
+                ProblemCategory = ProblemCategory.STRUCTURAL,
+                ProblemSubcategory = "No Defect Detected",
+                ProbableCause = "No structural defects were detected in the supplied image.",
+                RiskPrediction = "No immediate structural risk identified.",
+                RecommendedAction = "No action required. Continue routine periodic inspection.",
+                AiConfidenceScore = 0m,
+                IsDiyPossible = false,
+                EstimatedCostRange = "N/A",
+                UrgencyLevel = UrgencyLevel.LOW,
+                AiModelVersion = AI_MODEL_VERSION,
+                RawJson = rawJson,
+                ResultImageBase64 = response.ImageBase64,
+                HeatmapImageBase64 = response.HeatmapBase64
+            };
+        }
+
+        var subcategory = primary.Label ?? "Structural Defect";
+        var treatmentAction = primary.Treatment?.Action;
+
+        var probableCause = response.TotalInstances > 1
+            ? $"{response.TotalInstances} defect instance(s) detected across {response.DefectTypesCount} type(s); primary type: '{subcategory}' covering ~{primary.AreaPct:0.#}% of the image."
+            : $"'{subcategory}' detected covering ~{primary.AreaPct:0.#}% of the image.";
+
+        var riskPrediction = (overall?.RequiresClosure ?? false)
+            ? $"Severity '{overall?.Label}' (score {overall?.Score:0.#}). Closure / restricted access is recommended until inspected."
+            : $"Severity '{overall?.Label}' (score {overall?.Score:0.#}). Condition may deteriorate if left untreated.";
+
+        var recommendedAction = !string.IsNullOrWhiteSpace(treatmentAction)
+            ? treatmentAction!
+            : "Consult a qualified structural engineer for a detailed on-site assessment.";
+
+        return new DiagnosticResult
+        {
+            RiskLevel = riskLevel,
+            ProblemCategory = ProblemCategory.STRUCTURAL,
+            ProblemSubcategory = subcategory,
+            ProbableCause = Truncate(probableCause, 500),
+            RiskPrediction = Truncate(riskPrediction, 1000),
+            RecommendedAction = Truncate(recommendedAction, 1000),
+            AiConfidenceScore = Math.Round((decimal)primary.Confidence, 2),
+            IsDiyPossible = riskLevel == RiskLevel.LOW && !(overall?.RequiresClosure ?? false),
+            EstimatedCostRange = EstimateCostRange(riskLevel),
+            UrgencyLevel = urgency,
+            AiModelVersion = AI_MODEL_VERSION,
+            RawJson = rawJson,
+            ResultImageBase64 = response.ImageBase64,
+            HeatmapImageBase64 = response.HeatmapBase64
+        };
+    }
+
+    private static RiskLevel MapSeverityToRiskLevel(string? severityLabel)
+        => (severityLabel ?? string.Empty).Trim().ToLowerInvariant() switch
+        {
+            "severe" or "high" or "critical" => RiskLevel.HIGH,
+            "moderate" or "medium" => RiskLevel.MEDIUM,
+            _ => RiskLevel.LOW
+        };
+
+    private static UrgencyLevel MapToUrgency(RiskLevel riskLevel, bool requiresClosure)
+    {
+        if (requiresClosure) return UrgencyLevel.URGENT;
+        return riskLevel switch
+        {
+            RiskLevel.HIGH => UrgencyLevel.HIGH,
+            RiskLevel.MEDIUM => UrgencyLevel.MEDIUM,
+            _ => UrgencyLevel.LOW
+        };
+    }
+
+    private static string EstimateCostRange(RiskLevel riskLevel) => riskLevel switch
+    {
+        RiskLevel.HIGH => "$3,000-$15,000",
+        RiskLevel.MEDIUM => "$800-$3,000",
+        _ => "$200-$800"
+    };
+
+    private static string Truncate(string value, int maxLength)
+        => value.Length <= maxLength ? value : value[..maxLength];
 
     public List<string> GetRecommendations(ProblemCategory category, RiskLevel riskLevel, bool isDiyPossible)
     {
@@ -108,88 +203,5 @@ public class AiDiagnosticService : IAiDiagnosticService
         recommendations.Add("✅ Verify contractor licenses and insurance");
 
         return recommendations;
-    }
-
-    private DiagnosticResult GenerateMockDiagnostic(ImageMetadata metadata)
-    {
-        // Mock AI analysis - in production, this would call an actual AI model
-        var categories = Enum.GetValues<ProblemCategory>();
-        var riskLevels = Enum.GetValues<RiskLevel>();
-        var urgencyLevels = Enum.GetValues<UrgencyLevel>();
-
-        var category = categories[Random.Shared.Next(categories.Length)];
-        var riskLevel = riskLevels[Random.Shared.Next(riskLevels.Length)];
-        var urgencyLevel = urgencyLevels[Random.Shared.Next(urgencyLevels.Length)];
-        var confidence = Random.Shared.Next(75, 98);
-        var isDiyPossible = riskLevel == RiskLevel.LOW && Random.Shared.Next(0, 2) == 0;
-
-        var (subcategory, cause, prediction, action, costRange) = GetCategorySpecificDetails(category, riskLevel);
-
-        return new DiagnosticResult
-        {
-            ProblemCategory = category,
-            RiskLevel = riskLevel,
-            ProblemSubcategory = subcategory,
-            ProbableCause = cause,
-            RiskPrediction = prediction,
-            RecommendedAction = action,
-            AiConfidenceScore = confidence,
-            IsDiyPossible = isDiyPossible,
-            EstimatedCostRange = costRange,
-            UrgencyLevel = urgencyLevel,
-            ProcessingTimeMs = 0 // Will be set by caller
-        };
-    }
-
-    private (string subcategory, string cause, string prediction, string action, string costRange) 
-        GetCategorySpecificDetails(ProblemCategory category, RiskLevel riskLevel)
-    {
-        var details = category switch
-        {
-            ProblemCategory.PLUMBING => (
-                "Pipe Leak",
-                "Corrosion or loose fitting detected in visible pipe connection",
-                "Water damage may spread to surrounding materials if left unaddressed. Potential for mold growth within 48-72 hours.",
-                "Locate and shut off water supply. Contact licensed plumber for repair or replacement of affected pipe section.",
-                riskLevel == RiskLevel.HIGH ? "$500-$2,000" : "$200-$800"
-            ),
-            ProblemCategory.ELECTRICAL => (
-                "Wiring Issue",
-                "Exposed or damaged wiring detected, possible code violation",
-                "Fire hazard present. Risk of electrical shock or short circuit. May cause power outages.",
-                "Do not touch. Turn off power at breaker. Contact licensed electrician immediately.",
-                riskLevel == RiskLevel.HIGH ? "$800-$3,000" : "$300-$1,200"
-            ),
-            ProblemCategory.STRUCTURAL => (
-                "Foundation Crack",
-                "Settlement or soil movement causing visible crack in foundation",
-                "May compromise structural integrity. Water infiltration possible. Could worsen over time.",
-                "Monitor crack size. Consult structural engineer for assessment. May require foundation repair specialist.",
-                riskLevel == RiskLevel.HIGH ? "$3,000-$15,000" : "$800-$3,000"
-            ),
-            ProblemCategory.HVAC => (
-                "System Malfunction",
-                "Reduced efficiency or unusual noise indicating component wear",
-                "Decreased comfort levels. Higher energy bills. Complete system failure possible if neglected.",
-                "Schedule HVAC technician for inspection and service. May need component replacement.",
-                riskLevel == RiskLevel.HIGH ? "$1,500-$6,000" : "$300-$1,500"
-            ),
-            ProblemCategory.ROOFING => (
-                "Shingle Damage",
-                "Missing or damaged shingles detected, possible storm damage",
-                "Water leakage into attic or living space. Interior damage to ceilings and walls possible.",
-                "Inspect attic for water stains. Contact roofing contractor for repair or replacement.",
-                riskLevel == RiskLevel.HIGH ? "$2,000-$8,000" : "$500-$2,500"
-            ),
-            _ => (
-                "General Issue",
-                "Maintenance required based on visual inspection",
-                "May lead to more costly repairs if not addressed promptly",
-                "Contact qualified professional for detailed assessment",
-                "$200-$1,000"
-            )
-        };
-
-        return details;
     }
 }

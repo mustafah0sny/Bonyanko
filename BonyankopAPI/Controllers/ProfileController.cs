@@ -50,6 +50,56 @@ namespace BonyankopAPI.Controllers
         }
 
         /// <summary>
+        /// Validates an uploaded image, stores it under wwwroot/images/{userId}/
+        /// (replacing any previous image), and returns the stored relative URL.
+        /// Throws <see cref="InvalidImageException"/> when the file fails validation.
+        /// </summary>
+        private async Task<string> SaveProfileImageAsync(IFormFile file, Guid userId)
+        {
+            if (file == null || file.Length == 0)
+                throw new InvalidImageException("No file was provided");
+
+            if (file.Length > MaxFileSizeBytes)
+                throw new InvalidImageException("File exceeds the maximum allowed size of 5 MB");
+
+            var extension = Path.GetExtension(file.FileName).ToLowerInvariant();
+            if (string.IsNullOrEmpty(extension) || !AllowedExtensions.Contains(extension))
+                throw new InvalidImageException(
+                    $"Invalid file type. Allowed types: {string.Join(", ", AllowedExtensions)}");
+
+            // wwwroot/images/{userId}
+            var webRootPath = _environment.WebRootPath
+                ?? Path.Combine(_environment.ContentRootPath, "wwwroot");
+            var userFolder = Path.Combine(webRootPath, "images", userId.ToString());
+            Directory.CreateDirectory(userFolder);
+
+            // Remove any previously stored image for this user
+            foreach (var existing in Directory.EnumerateFiles(userFolder))
+            {
+                System.IO.File.Delete(existing);
+            }
+
+            var fileName = $"{Guid.NewGuid()}{extension}";
+            var absolutePath = Path.Combine(userFolder, fileName);
+
+            await using (var stream = new FileStream(absolutePath, FileMode.Create))
+            {
+                await file.CopyToAsync(stream);
+            }
+
+            // Web-accessible relative path (served via UseStaticFiles)
+            return $"/images/{userId}/{fileName}";
+        }
+
+        /// <summary>
+        /// Raised when an uploaded image fails validation (missing, too large, or wrong type).
+        /// </summary>
+        private sealed class InvalidImageException : Exception
+        {
+            public InvalidImageException(string message) : base(message) { }
+        }
+
+        /// <summary>
         /// Get current user profile
         /// </summary>
         /// <returns>User profile information</returns>
@@ -170,25 +220,6 @@ namespace BonyankopAPI.Controllers
         {
             try
             {
-                if (file == null || file.Length == 0)
-                {
-                    return BadRequest(new { message = "No file was provided" });
-                }
-
-                if (file.Length > MaxFileSizeBytes)
-                {
-                    return BadRequest(new { message = "File exceeds the maximum allowed size of 5 MB" });
-                }
-
-                var extension = Path.GetExtension(file.FileName).ToLowerInvariant();
-                if (string.IsNullOrEmpty(extension) || !AllowedExtensions.Contains(extension))
-                {
-                    return BadRequest(new
-                    {
-                        message = $"Invalid file type. Allowed types: {string.Join(", ", AllowedExtensions)}"
-                    });
-                }
-
                 var userId = _tokenService.GetUserIdFromToken(User);
                 var user = await _userRepository.GetByIdAsync(userId);
 
@@ -197,28 +228,7 @@ namespace BonyankopAPI.Controllers
                     return NotFound(new { message = "User not found" });
                 }
 
-                // wwwroot/images/{userId}
-                var webRootPath = _environment.WebRootPath
-                    ?? Path.Combine(_environment.ContentRootPath, "wwwroot");
-                var userFolder = Path.Combine(webRootPath, "images", userId.ToString());
-                Directory.CreateDirectory(userFolder);
-
-                // Remove any previously stored image for this user
-                foreach (var existing in Directory.EnumerateFiles(userFolder))
-                {
-                    System.IO.File.Delete(existing);
-                }
-
-                var fileName = $"{Guid.NewGuid()}{extension}";
-                var absolutePath = Path.Combine(userFolder, fileName);
-
-                await using (var stream = new FileStream(absolutePath, FileMode.Create))
-                {
-                    await file.CopyToAsync(stream);
-                }
-
-                // Store a web-accessible relative path (served via UseStaticFiles)
-                var relativeUrl = $"/images/{userId}/{fileName}";
+                var relativeUrl = await SaveProfileImageAsync(file, userId);
                 user.ProfilePictureUrl = relativeUrl;
                 user.UpdatedAt = DateTime.UtcNow;
                 _userRepository.Update(user);
@@ -229,6 +239,79 @@ namespace BonyankopAPI.Controllers
                     message = "Profile picture uploaded successfully",
                     profilePictureUrl = BuildImageUrl(relativeUrl)
                 });
+            }
+            catch (InvalidImageException ex)
+            {
+                return BadRequest(new { message = ex.Message });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { message = "An error occurred", error = ex.Message });
+            }
+        }
+
+        /// <summary>
+        /// Update profile data and (optionally) the profile picture in a single request.
+        /// Send as multipart/form-data: text fields for FullName/PhoneNumber and an
+        /// optional Image file. When an image is supplied it is stored under
+        /// wwwroot/images/{userId}/ and replaces the previous one.
+        /// </summary>
+        /// <param name="updateDto">Profile fields plus an optional image file</param>
+        /// <returns>Updated user information</returns>
+        /// <response code="200">Profile updated successfully</response>
+        /// <response code="400">Invalid image file</response>
+        /// <response code="401">Unauthorized</response>
+        /// <response code="404">User not found</response>
+        [HttpPut("with-image")]
+        [Consumes("multipart/form-data")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        [ProducesResponseType(StatusCodes.Status400BadRequest)]
+        [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+        [ProducesResponseType(StatusCodes.Status404NotFound)]
+        public async Task<ActionResult<object>> UpdateProfileWithImage([FromForm] UpdateProfileWithImageDto updateDto)
+        {
+            try
+            {
+                var userId = _tokenService.GetUserIdFromToken(User);
+                var user = await _userRepository.GetByIdAsync(userId);
+
+                if (user == null)
+                {
+                    return NotFound(new { message = "User not found" });
+                }
+
+                if (!string.IsNullOrEmpty(updateDto.FullName))
+                    user.FullName = updateDto.FullName;
+
+                if (updateDto.PhoneNumber != null)
+                    user.PhoneNumber = updateDto.PhoneNumber;
+
+                if (updateDto.Image != null && updateDto.Image.Length > 0)
+                {
+                    user.ProfilePictureUrl = await SaveProfileImageAsync(updateDto.Image, userId);
+                }
+
+                user.UpdatedAt = DateTime.UtcNow;
+                _userRepository.Update(user);
+                await _userRepository.SaveChangesAsync();
+
+                return Ok(new
+                {
+                    message = "Profile updated successfully",
+                    user = new
+                    {
+                        userId = user.Id,
+                        email = user.Email,
+                        fullName = user.FullName,
+                        phoneNumber = user.PhoneNumber,
+                        profilePictureUrl = BuildImageUrl(user.ProfilePictureUrl),
+                        role = user.Role.ToString()
+                    }
+                });
+            }
+            catch (InvalidImageException ex)
+            {
+                return BadRequest(new { message = ex.Message });
             }
             catch (Exception ex)
             {

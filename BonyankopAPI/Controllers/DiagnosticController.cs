@@ -5,6 +5,8 @@ using BonyankopAPI.Models;
 using BonyankopAPI.Repositories;
 using BonyankopAPI.Interfaces;
 using System.Security.Claims;
+using BonyankopAPI.Services;
+using Microsoft.IdentityModel.Tokens;
 
 namespace BonyankopAPI.Controllers;
 
@@ -12,65 +14,114 @@ namespace BonyankopAPI.Controllers;
 [Route("api/[controller]")]
 public class DiagnosticController : ControllerBase
 {
+    private static readonly string[] AllowedExtensions = { ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp" };
+    private const long MaxFileSizeBytes = 10 * 1024 * 1024; // 10 MB
+
     private readonly IDiagnosticRepository _diagnosticRepository;
     private readonly IAiDiagnosticService _aiService;
     private readonly IUserRepository _userRepository;
+    private readonly IWebHostEnvironment _environment;
+    private readonly ITokenService _tokenService;
+
 
     public DiagnosticController(
         IDiagnosticRepository diagnosticRepository,
         IAiDiagnosticService aiService,
-        IUserRepository userRepository)
+        IUserRepository userRepository,
+        IWebHostEnvironment environment,
+        ITokenService tokenService)
     {
         _diagnosticRepository = diagnosticRepository;
         _aiService = aiService;
         _userRepository = userRepository;
+        _environment = environment;
+        _tokenService = tokenService;
     }
 
     /// <summary>
-    /// Analyze an image using AI to diagnose home maintenance issues
+    /// Analyze an uploaded image with the CrackVision AI model to detect structural damage.
+    /// The uploaded image is stored under wwwroot/images/{userId}/uploads/ and the model's
+    /// annotated result and heatmap images are saved alongside it.
+    /// Send as multipart/form-data with an "Image" file field.
     /// </summary>
     [HttpPost("analyze")]
+    [Consumes("multipart/form-data")]
     //[Authorize(Roles = "CITIZEN,ADMIN")]
-    public async Task<IActionResult> AnalyzeImage([FromBody] AnalyzeImageDto dto)
+    public async Task<IActionResult> AnalyzeImage([FromForm] AnalyzeImageUploadDto dto)
     {
-        var userIdClaim = User.FindFirstValue(ClaimTypes.NameIdentifier);
-        if (string.IsNullOrEmpty(userIdClaim) || !Guid.TryParse(userIdClaim, out var userId))
-        {
-            return Unauthorized(new { message = "Invalid user token" });
-        }
-
+        var userId = _tokenService.GetUserIdFromToken(User);
         var user = await _userRepository.GetByIdAsync(userId);
+
         if (user == null)
         {
             return NotFound(new { message = "User not found" });
         }
 
-        // Prepare metadata
-        var metadata = dto.Metadata != null ? new ImageMetadata
+        var file = dto.Image;
+        if (file == null || file.Length == 0)
         {
-            Width = dto.Metadata.Width,
-            Height = dto.Metadata.Height,
-            Format = dto.Metadata.Format,
-            Size = dto.Metadata.Size,
-            CapturedAt = dto.Metadata.CapturedAt
-        } : new ImageMetadata
+            return BadRequest(new { message = "No image file was provided" });
+        }
+        if (file.Length > MaxFileSizeBytes)
         {
-            Width = 1920,
-            Height = 1080,
-            Format = "jpeg",
-            Size = 0,
+            return BadRequest(new { message = "File exceeds the maximum allowed size of 10 MB" });
+        }
+
+        var extension = Path.GetExtension(file.FileName).ToLowerInvariant();
+        if (string.IsNullOrEmpty(extension) || !AllowedExtensions.Contains(extension))
+        {
+            return BadRequest(new
+            {
+                message = $"Invalid file type. Allowed types: {string.Join(", ", AllowedExtensions)}"
+            });
+        }
+
+        // Read the uploaded file into memory once (used for both storage and AI call).
+        byte[] imageBytes;
+        await using (var ms = new MemoryStream())
+        {
+            await file.CopyToAsync(ms);
+            imageBytes = ms.ToArray();
+        }
+
+        // Save the user-uploaded image: wwwroot/images/{userId}/uploads/{userId}_{date}.{ext}
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var uploadFileName = $"{userId}_{timestamp}{extension}";
+        var uploadRelativeUrl = SaveImageBytes(imageBytes, userId, "uploads", uploadFileName);
+
+        // Call the CrackVision AI model.
+        var contentType = string.IsNullOrWhiteSpace(file.ContentType) ? "image/jpeg" : file.ContentType;
+        DiagnosticResult aiResult;
+        try
+        {
+            aiResult = await _aiService.AnalyzeImageAsync(imageBytes, file.FileName, contentType, HttpContext.RequestAborted);
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(StatusCodes.Status502BadGateway, new
+            {
+                message = "The AI analysis service is currently unavailable. Please try again.",
+                error = ex.Message
+            });
+        }
+
+        // Persist the model's annotated result / heatmap images (decoded from base64), if present.
+        var resultImageUrl = SaveBase64Image(aiResult.ResultImageBase64, userId, "results", $"{userId}_{timestamp}_result.png");
+        var heatmapImageUrl = SaveBase64Image(aiResult.HeatmapImageBase64, userId, "results", $"{userId}_{timestamp}_heatmap.png");
+
+        var metadata = new ImageMetadata
+        {
+            Format = extension.TrimStart('.'),
+            Size = imageBytes.Length,
             CapturedAt = DateTime.UtcNow
         };
-
-        // Call AI service to analyze image
-        var aiResult = await _aiService.AnalyzeImageAsync(dto.ImageUrl, metadata);
 
         // Create diagnostic record
         var diagnostic = new Diagnostic
         {
             DiagnosticId = Guid.NewGuid(),
             CitizenId = userId,
-            ImageUrl = dto.ImageUrl,
+            ImageUrl = uploadRelativeUrl,
             ImageMetadata = metadata,
             RiskLevel = aiResult.RiskLevel,
             ProblemCategory = aiResult.ProblemCategory,
@@ -79,11 +130,14 @@ public class DiagnosticController : ControllerBase
             RiskPrediction = aiResult.RiskPrediction,
             RecommendedAction = aiResult.RecommendedAction,
             AiConfidenceScore = aiResult.AiConfidenceScore,
-            AiModelVersion = "v1.0.0-mock",
+            AiModelVersion = aiResult.AiModelVersion,
             ProcessingTimeMs = aiResult.ProcessingTimeMs,
             IsDiyPossible = aiResult.IsDiyPossible,
             EstimatedCostRange = aiResult.EstimatedCostRange,
             UrgencyLevel = aiResult.UrgencyLevel,
+            AiRawResponseJson = aiResult.RawJson,
+            ResultImageUrl = resultImageUrl,
+            HeatmapImageUrl = heatmapImageUrl,
             CreatedAt = DateTime.UtcNow
         };
 
@@ -102,6 +156,63 @@ public class DiagnosticController : ControllerBase
     }
 
     /// <summary>
+    /// Writes raw image bytes under wwwroot/images/{userId}/{subFolder}/{fileName}
+    /// and returns the web-accessible relative path.
+    /// </summary>
+    private string SaveImageBytes(byte[] bytes, Guid userId, string subFolder, string fileName)
+    {
+        var webRootPath = _environment.WebRootPath
+            ?? Path.Combine(_environment.ContentRootPath, "wwwroot");
+        var folder = Path.Combine(webRootPath, "images", userId.ToString(), subFolder);
+        Directory.CreateDirectory(folder);
+
+        var absolutePath = Path.Combine(folder, fileName);
+        System.IO.File.WriteAllBytes(absolutePath, bytes);
+
+        return $"/images/{userId}/{subFolder}/{fileName}";
+    }
+
+    /// <summary>
+    /// Decodes a (possibly null / data-URI-prefixed) base64 image string and saves it.
+    /// Returns null when no image data is supplied.
+    /// </summary>
+    private string? SaveBase64Image(string? base64, Guid userId, string subFolder, string fileName)
+    {
+        if (string.IsNullOrWhiteSpace(base64))
+            return null;
+
+        // Strip an optional data-URI prefix (e.g. "data:image/png;base64,").
+        var commaIndex = base64.IndexOf(',');
+        if (base64.StartsWith("data:", StringComparison.OrdinalIgnoreCase) && commaIndex >= 0)
+        {
+            base64 = base64[(commaIndex + 1)..];
+        }
+
+        try
+        {
+            var bytes = Convert.FromBase64String(base64);
+            return SaveImageBytes(bytes, userId, subFolder, fileName);
+        }
+        catch (FormatException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Builds an absolute, client-loadable URL from a stored relative image path.
+    /// </summary>
+    private string? BuildImageUrl(string? storedPath)
+    {
+        if (string.IsNullOrEmpty(storedPath))
+            return null;
+        if (Uri.IsWellFormedUriString(storedPath, UriKind.Absolute))
+            return storedPath;
+        var request = HttpContext.Request;
+        return $"{request.Scheme}://{request.Host}{storedPath}";
+    }
+
+    /// <summary>
     /// Get diagnostic by ID
     /// </summary>
     [HttpGet("{diagnosticId}")]
@@ -115,14 +226,12 @@ public class DiagnosticController : ControllerBase
         }
 
         // Check if user has access (owner or admin)
-        var userIdClaim = User.FindFirstValue(ClaimTypes.NameIdentifier);
-        if (!string.IsNullOrEmpty(userIdClaim) && Guid.TryParse(userIdClaim, out var userId))
+        var userId = _tokenService.GetUserIdFromToken(User);
+        var user = await _userRepository.GetByIdAsync(userId);
+
+        if (user == null)
         {
-            var user = await _userRepository.GetByIdAsync(userId);
-            if (user?.Role != UserRole.ADMIN && diagnostic.CitizenId != userId)
-            {
-                return Forbid();
-            }
+            return NotFound(new { message = "User not found" });
         }
 
         var recommendations = _aiService.GetRecommendations(
@@ -142,10 +251,12 @@ public class DiagnosticController : ControllerBase
     //[Authorize(Roles = "CITIZEN,ADMIN")]
     public async Task<IActionResult> GetMyDiagnostics()
     {
-        var userIdClaim = User.FindFirstValue(ClaimTypes.NameIdentifier);
-        if (string.IsNullOrEmpty(userIdClaim) || !Guid.TryParse(userIdClaim, out var userId))
+        var userId = _tokenService.GetUserIdFromToken(User);
+        var user = await _userRepository.GetByIdAsync(userId);
+
+        if (user == null)
         {
-            return Unauthorized(new { message = "Invalid user token" });
+            return NotFound(new { message = "User not found" });
         }
 
         var diagnostics = await _diagnosticRepository.GetByCitizenIdAsync(userId);
@@ -231,13 +342,13 @@ public class DiagnosticController : ControllerBase
         return Ok(statistics);
     }
 
-    private static DiagnosticResponseDto MapToResponseDto(Diagnostic diagnostic, List<string> recommendations)
+    private DiagnosticResponseDto MapToResponseDto(Diagnostic diagnostic, List<string> recommendations)
     {
         return new DiagnosticResponseDto
         {
             DiagnosticId = diagnostic.DiagnosticId,
             CitizenId = diagnostic.CitizenId,
-            ImageUrl = diagnostic.ImageUrl,
+            ImageUrl = BuildImageUrl(diagnostic.ImageUrl) ?? diagnostic.ImageUrl,
             Metadata = new ImageMetadataDto
             {
                 Width = diagnostic.ImageMetadata.Width,
@@ -258,6 +369,8 @@ public class DiagnosticController : ControllerBase
             IsDiyPossible = diagnostic.IsDiyPossible,
             EstimatedCostRange = diagnostic.EstimatedCostRange,
             UrgencyLevel = diagnostic.UrgencyLevel?.ToString(),
+            HeatmapImageUrl = BuildImageUrl(diagnostic.HeatmapImageUrl),
+            ResultImageUrl = BuildImageUrl(diagnostic.ResultImageUrl),
             Recommendations = recommendations,
             CreatedAt = diagnostic.CreatedAt
         };
