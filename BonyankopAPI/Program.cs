@@ -43,7 +43,7 @@ builder.Host.UseSerilog();
 builder.Services.AddControllers();
 
 // Configure application services
-builder.Services.AddApplicationServices();
+builder.Services.AddApplicationServices(builder.Configuration);
 builder.Services.AddDatabaseConfiguration(builder.Configuration);
 builder.Services.AddIdentityConfiguration();
 builder.Services.AddJwtAuthentication(builder.Configuration);

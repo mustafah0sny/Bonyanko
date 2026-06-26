@@ -6,7 +6,9 @@ namespace BonyankopAPI.Extensions
 {
     public static class DependencyInjectionExtensions
     {
-        public static IServiceCollection AddApplicationServices(this IServiceCollection services)
+        public static IServiceCollection AddApplicationServices(
+            this IServiceCollection services,
+            IConfiguration configuration)
         {
             // Register repositories
             services.AddScoped(typeof(IRepository<>), typeof(Repository<>));
@@ -24,6 +26,20 @@ namespace BonyankopAPI.Extensions
             // Register custom services
             services.AddScoped<ITokenService, TokenService>();
             services.AddScoped<IAiDiagnosticService, AiDiagnosticService>();
+
+            // CrackVision AI structural-damage-detection model
+            services.Configure<CrackVisionOptions>(
+                configuration.GetSection(CrackVisionOptions.SectionName));
+
+            var crackVisionOptions = configuration
+                .GetSection(CrackVisionOptions.SectionName)
+                .Get<CrackVisionOptions>() ?? new CrackVisionOptions();
+
+            services.AddHttpClient<ICrackVisionClient, CrackVisionClient>(client =>
+            {
+                client.BaseAddress = new Uri(crackVisionOptions.BaseUrl);
+                client.Timeout = TimeSpan.FromSeconds(crackVisionOptions.TimeoutSeconds);
+            });
 
             return services;
         }

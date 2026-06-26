@@ -5,9 +5,17 @@ namespace BonyankopAPI.Interfaces;
 public interface IAiDiagnosticService
 {
     /// <summary>
-    /// Analyze an image and generate diagnostic results
+    /// Analyze an image with the CrackVision AI model and produce a diagnostic result.
     /// </summary>
-    Task<DiagnosticResult> AnalyzeImageAsync(string imageUrl, ImageMetadata metadata);
+    /// <param name="imageBytes">Raw image content.</param>
+    /// <param name="fileName">Original file name.</param>
+    /// <param name="contentType">Image MIME type.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    Task<DiagnosticResult> AnalyzeImageAsync(
+        byte[] imageBytes,
+        string fileName,
+        string contentType,
+        CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Get recommendations based on diagnostic results
@@ -28,4 +36,14 @@ public class DiagnosticResult
     public string EstimatedCostRange { get; set; } = string.Empty;
     public UrgencyLevel UrgencyLevel { get; set; }
     public int ProcessingTimeMs { get; set; }
+    public string AiModelVersion { get; set; } = string.Empty;
+
+    /// <summary>Full raw JSON returned by the model (persisted verbatim).</summary>
+    public string RawJson { get; set; } = string.Empty;
+
+    /// <summary>Base64-encoded annotated result image (PNG), if any.</summary>
+    public string? ResultImageBase64 { get; set; }
+
+    /// <summary>Base64-encoded heatmap image (PNG), if any.</summary>
+    public string? HeatmapImageBase64 { get; set; }
 }

@@ -63,6 +63,24 @@ public class Diagnostic
 
     public UrgencyLevel? UrgencyLevel { get; set; }
 
+    /// <summary>
+    /// Full, raw JSON response returned by the CrackVision AI model.
+    /// Stored verbatim so no detail (per-defect detections, treatment, factors…) is lost.
+    /// </summary>
+    public string? AiRawResponseJson { get; set; }
+
+    /// <summary>
+    /// Web-accessible relative path to the saved heatmap image produced by the model.
+    /// </summary>
+    [MaxLength(500)]
+    public string? HeatmapImageUrl { get; set; }
+
+    /// <summary>
+    /// Web-accessible relative path to the saved annotated result image produced by the model.
+    /// </summary>
+    [MaxLength(500)]
+    public string? ResultImageUrl { get; set; }
+
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
 
     // Navigation property

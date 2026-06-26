@@ -3,13 +3,15 @@ using BonyankopAPI.Models;
 
 namespace BonyankopAPI.DTOs;
 
-public class AnalyzeImageDto
+/// <summary>
+/// Request to analyze an uploaded image with the CrackVision AI model
+/// (sent as multipart/form-data).
+/// </summary>
+public class AnalyzeImageUploadDto
 {
+    /// <summary>The image file to analyze.</summary>
     [Required]
-    [Url]
-    public string ImageUrl { get; set; } = string.Empty;
-
-    public ImageMetadataDto? Metadata { get; set; }
+    public IFormFile Image { get; set; } = default!;
 }
 
 public class ImageMetadataDto
@@ -39,6 +41,8 @@ public class DiagnosticResponseDto
     public bool IsDiyPossible { get; set; }
     public string? EstimatedCostRange { get; set; }
     public string? UrgencyLevel { get; set; }
+    public string? HeatmapImageUrl { get; set; }
+    public string? ResultImageUrl { get; set; }
     public List<string> Recommendations { get; set; } = new();
     public DateTime CreatedAt { get; set; }
 }
